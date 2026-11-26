@@ -130,7 +130,7 @@ OpenALPlayer::OpenALPlayer(agi::AudioProvider *provider)
 	if (!device) throw AudioPlayerOpenError("Failed opening default OpenAL device");
 
 	// Determine buffer length
-	decode_buffer.resize(samplerate * bpf / num_buffers / 2); // buffers for half a second of audio
+	decode_buffer.resize((samplerate / num_buffers / 2) * bpf); // buffers for half a second of audio
 }
 
 OpenALPlayer::~OpenALPlayer()
@@ -214,28 +214,26 @@ void OpenALPlayer::Play(int64_t start, int64_t count)
 
 void OpenALPlayer::Stop()
 {
-	TeardownContext();
-	if (!playing) return;
-
-	// Reset data
 	wxTimer::Stop();
 	playing = false;
 	start_frame = 0;
 	cur_frame = 0;
 	end_frame = 0;
 
-	// Then drop the playback
-	alcMakeContextCurrent(context);
-	alSourceStop(source);
-	alSourcei(source, AL_BUFFER, 0);
-	alcMakeContextCurrent(nullptr);
+	// Stop and detach the source while its context is still valid.
+	if (context) {
+		alcMakeContextCurrent(context);
+		alSourceStop(source);
+		alSourcei(source, AL_BUFFER, 0);
+		TeardownContext();
+	}
 }
 
 void OpenALPlayer::FillBuffers(ALsizei count)
 {
 	InitContext();
 	// Do the actual filling/queueing
-	for (count = mid(1, count, buffers_free); count > 0; --count) {
+	for (count = mid(0, count, buffers_free); count > 0; --count) {
 		ALsizei fill_len = mid<ALsizei>(0, decode_buffer.size() / bpf, end_frame - cur_frame);
 
 		if (fill_len > 0)
@@ -247,7 +245,8 @@ void OpenALPlayer::FillBuffers(ALsizei count)
 
 		cur_frame += fill_len;
 
-		alBufferData(buffers[buf_first_free], AL_FORMAT_MONO16, &decode_buffer[0], decode_buffer.size(), samplerate);
+		alBufferData(buffers[buf_first_free], provider->GetChannels() == 1 ? AL_FORMAT_MONO16 : AL_FORMAT_STEREO16,
+			&decode_buffer[0], decode_buffer.size(), samplerate);
 		alSourceQueueBuffers(source, 1, &buffers[buf_first_free]); // FIXME: collect buffer handles and queue all at once instead of one at a time?
 		buf_first_free = (buf_first_free + 1) % num_buffers;
 		--buffers_free;
@@ -256,7 +255,7 @@ void OpenALPlayer::FillBuffers(ALsizei count)
 
 void OpenALPlayer::Notify()
 {
-	InitContext();
+	if (!playing) return;
 	alcMakeContextCurrent(context);
 	ALsizei newplayed;
 	alGetSourcei(source, AL_BUFFERS_PROCESSED, &newplayed);
@@ -280,6 +279,10 @@ void OpenALPlayer::Notify()
 		// Fill more buffers
 		FillBuffers(newplayed);
 	}
+
+	ALint state = AL_INITIAL;
+	alGetSourcei(source, AL_SOURCE_STATE, &state);
+	if (state == AL_STOPPED) alSourcePlay(source); // Recover after an underrun.
 
 	LOG_D("player/audio/openal") << "frames played=" << (buffers_played - num_buffers) * decode_buffer.size() / bpf << " num frames=" << end_frame - start_frame;
 	// Check that all of the selected audio plus one full set of buffers has been queued
