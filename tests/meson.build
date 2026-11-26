@@ -17,6 +17,11 @@ tests_src = [
 
     'tests/access.cpp',
     'tests/audio.cpp',
+    'tests/audio_spectrum.cpp',
+    '../src/audio_colorscheme.cpp',
+    '../src/audio_renderer.cpp',
+    '../src/colorspace.cpp',
+    '../src/fft.cpp',
     'tests/cajun.cpp',
     'tests/calltip_provider.cpp',
     'tests/character_count.cpp',

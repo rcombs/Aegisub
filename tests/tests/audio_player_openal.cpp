@@ -121,3 +121,43 @@ TEST(NativeOpenAL, LatencyDrainUnderrunAndEndpointChanges) {
 	player->Stop();
 	EXPECT_EQ(AL_NO_ERROR, alGetError());
 }
+
+namespace {
+class SilentStereoProvider : public agi::AudioProvider {
+public:
+	SilentStereoProvider() {
+		channels = 2;
+		sample_rate = 44100;
+		bytes_per_sample = 2;
+		num_samples = decoded_samples = sample_rate * 10;
+	}
+	void FillBuffer(void *buf, int64_t, int64_t count) const override {
+		memset(buf, 0, count * channels * bytes_per_sample);
+	}
+};
+}
+
+TEST(NativeOpenAL, StereoBuffersUseSampleFramesForThePlaybackClock) {
+	SilentStereoProvider provider;
+	std::unique_ptr<OpenALPlayer> player;
+	try {
+		player = std::make_unique<OpenALPlayer>(&provider);
+	}
+	catch (AudioPlayerOpenError const&) {
+		GTEST_SKIP() << "No native OpenAL output device available";
+	}
+	struct ResetLatency {
+		~ResetLatency() { injected_latency = -1; }
+	} reset_latency;
+	injected_latency = 0;
+	player->Play(44100, 44100 * 5);
+	auto start = std::chrono::steady_clock::now();
+	std::this_thread::sleep_for(150ms);
+	ManualTimer::Tick();
+	double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+	double played = (player->GetCurrentPosition() - 44100) / 44100.;
+	EXPECT_GT(played, elapsed - 0.1);
+	EXPECT_LT(played, elapsed + 0.08);
+	EXPECT_EQ(AL_NO_ERROR, alGetError());
+	player->Stop();
+}

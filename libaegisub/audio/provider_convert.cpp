@@ -141,8 +141,9 @@ public:
 };
 
 /// Sample doubler with linear interpolation for the samples provider
-/// Requires 16-bit mono input
+/// Requires interleaved 16-bit input
 class SampleDoublingAudioProvider final : public AudioProviderWrapper {
+	mutable std::vector<int16_t> src_buf;
 public:
 	SampleDoublingAudioProvider(std::unique_ptr<AudioProvider> src) : AudioProviderWrapper(std::move(src)) {
 		sample_rate *= 2;
@@ -151,27 +152,19 @@ public:
 	}
 
 	void FillBuffer(void *buf, int64_t start, int64_t count) const override {
-		int16_t *src, *dst = static_cast<int16_t *>(buf);
-
-		// We need to always get at least two samples to be able to interpolate
-		int16_t srcbuf[2];
-		if (count == 1) {
-			source->GetAudio(srcbuf, start / 2, 2);
-			src = srcbuf;
-		}
-		else {
-			source->GetAudio(buf, start / 2, (start + count) / 2 - start / 2 + 1);
-			src = dst;
-		}
-
-		// walking backwards so that the conversion can be done in place
-		for (; count > 0; --count) {
-			auto src_index = (start + count - 1) / 2 - start / 2;
-			auto i = count - 1;
-			if ((start + i) & 1)
-				dst[i] = (int16_t)(((int32_t)src[src_index] + src[src_index + 1]) / 2);
-			else
-				dst[i] = src[src_index];
+		auto first = start / 2;
+		auto frames = (start + count - 1) / 2 - first + 2;
+		src_buf.resize(frames * channels);
+		source->GetAudio(src_buf.data(), first, frames);
+		auto dst = static_cast<int16_t *>(buf);
+		for (int64_t i = 0; i < count; ++i) {
+			auto index = ((start + i) / 2 - first) * channels;
+			for (int channel = 0; channel < channels; ++channel) {
+				int sample = src_buf[index + channel];
+				if ((start + i) & 1)
+					sample = (sample + src_buf[index + channels + channel]) / 2;
+				dst[i * channels + channel] = sample;
+			}
 		}
 	}
 };
@@ -192,8 +185,9 @@ std::unique_ptr<AudioProvider> CreateConvertAudioProvider(std::unique_ptr<AudioP
 		provider = std::make_unique<BitdepthConvertAudioProvider<int16_t>>(std::move(provider));
 	}
 
-	// We currently only support mono audio
-	if (provider->GetChannels() != 1) {
+	// Preserve mono/stereo. Keep the legacy fallback for sources without a
+	// channel-aware surround downmixer (FFMS2 handles surround itself).
+	if (provider->GetChannels() > 2) {
 		LOG_D("audio_provider") << "Downmixing to mono from " << provider->GetChannels() << " channels";
 		provider = std::make_unique<DownmixAudioProvider>(std::move(provider));
 	}
