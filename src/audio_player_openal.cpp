@@ -35,7 +35,6 @@
 #ifdef WITH_OPENAL
 #include "include/aegisub/audio_player.h"
 
-#include "audio_controller.h"
 #include "utils.h"
 
 #include <libaegisub/audio/provider.h>
@@ -47,11 +46,15 @@
 #elif defined(__APPLE__)
 #include <OpenAL/al.h>
 #include <OpenAL/alc.h>
+#include <CoreAudio/CoreAudio.h>
 #else
 #include <AL/al.h>
 #include <AL/alc.h>
 #endif
 
+#include <algorithm>
+#include <chrono>
+#include <cstring>
 #include <vector>
 #include <wx/timer.h>
 
@@ -61,6 +64,50 @@
 #endif
 
 namespace {
+#ifdef __APPLE__
+// Apple's OpenAL source offset is the mixer's read position. Its default-output
+// Audio Unit adds the HAL buffer, safety offset, stream and device latencies.
+// Query again while playing: Bluetooth routes can have very different delays.
+double GetOutputLatency() {
+	auto get = [](AudioObjectID object, AudioObjectPropertySelector selector,
+	              AudioObjectPropertyScope scope, auto &value) {
+		AudioObjectPropertyAddress address{selector, scope, kAudioObjectPropertyElementMain};
+		UInt32 size = sizeof(value);
+		return AudioObjectGetPropertyData(object, &address, 0, nullptr, &size, &value) == noErr;
+	};
+	AudioDeviceID output = kAudioObjectUnknown;
+	if (!get(kAudioObjectSystemObject, kAudioHardwarePropertyDefaultOutputDevice,
+	         kAudioObjectPropertyScopeGlobal, output)) return 0;
+	Float64 rate = 0;
+	if (!get(output, kAudioDevicePropertyNominalSampleRate,
+	         kAudioObjectPropertyScopeGlobal, rate) || rate <= 0) return 0;
+
+	uint64_t frames = 0;
+	const AudioObjectPropertySelector selectors[] = {kAudioDevicePropertyLatency,
+		kAudioDevicePropertySafetyOffset, kAudioDevicePropertyBufferFrameSize};
+	for (auto selector : selectors) {
+		UInt32 value = 0;
+		if (get(output, selector, kAudioDevicePropertyScopeOutput, value)) frames += value;
+	}
+	AudioObjectPropertyAddress address{kAudioDevicePropertyStreams,
+		kAudioDevicePropertyScopeOutput, kAudioObjectPropertyElementMain};
+	UInt32 size = 0;
+	if (AudioObjectGetPropertyDataSize(output, &address, 0, nullptr, &size) == noErr && size) {
+		std::vector<AudioStreamID> streams(size / sizeof(AudioStreamID));
+		if (AudioObjectGetPropertyData(output, &address, 0, nullptr, &size, streams.data()) == noErr) {
+			UInt32 latency = 0;
+			for (auto stream : streams) {
+				UInt32 value = 0;
+				if (get(stream, kAudioStreamPropertyLatency, kAudioObjectPropertyScopeGlobal, value))
+					latency = std::max(latency, value);
+			}
+			frames += latency;
+		}
+	}
+	return frames / rate;
+}
+#endif
+
 class OpenALPlayer final : public AudioPlayer, wxTimer {
 	/// Number of OpenAL buffers to use
 	static const ALsizei num_buffers = 8;
@@ -90,9 +137,16 @@ class OpenALPlayer final : public AudioPlayer, wxTimer {
 	ALsizei buffers_free = 0;
 
 	/// Number of buffers which have been fully played since playback was last started
-	ALsizei buffers_played = 0;
+	int64_t buffers_played = 0;
+	int64_t last_position = 0;
+	int64_t last_mix_position = 0;
+	std::chrono::steady_clock::time_point last_mix_time;
+	double output_latency = 0;
+	std::chrono::steady_clock::time_point next_latency_update;
 
-	wxStopWatch playback_segment_timer;
+	// Load dynamically so Apple's OpenAL 1.1 headers can also build this backend.
+	using GetSourcedv = void (AL_APIENTRY *)(ALuint, ALenum, ALdouble *);
+	GetSourcedv get_source_latency = nullptr;
 
 	/// Buffer to decode audio into
 	std::vector<char> decode_buffer;
@@ -105,6 +159,7 @@ class OpenALPlayer final : public AudioPlayer, wxTimer {
 
 	void InitContext();
 	void TeardownContext();
+	void UpdateLatency();
 
 public:
 	OpenALPlayer(agi::AudioProvider *provider);
@@ -130,7 +185,7 @@ OpenALPlayer::OpenALPlayer(agi::AudioProvider *provider)
 	if (!device) throw AudioPlayerOpenError("Failed opening default OpenAL device");
 
 	// Determine buffer length
-	decode_buffer.resize((samplerate / num_buffers / 2) * bpf); // buffers for half a second of audio
+	decode_buffer.resize((samplerate / num_buffers / 2) * bpf); // half a second, in whole sample frames
 }
 
 OpenALPlayer::~OpenALPlayer()
@@ -162,6 +217,8 @@ void OpenALPlayer::InitContext()
 			alDeleteBuffers(num_buffers, buffers);
 			throw AudioPlayerOpenError("Error generating OpenAL source");
 		}
+		get_source_latency = alIsExtensionPresent("AL_SOFT_source_latency")
+			? reinterpret_cast<GetSourcedv>(alGetProcAddress("alGetSourcedvSOFT")) : nullptr;
 	}
 	catch (...)
 	{
@@ -197,7 +254,10 @@ void OpenALPlayer::Play(int64_t start, int64_t count)
 	start_frame = start;
 	cur_frame = start;
 	end_frame = start + count;
+	last_position = start;
 	playing = true;
+	next_latency_update = {};
+	UpdateLatency();
 
 	// Prepare buffers
 	buffers_free = num_buffers;
@@ -208,19 +268,16 @@ void OpenALPlayer::Play(int64_t start, int64_t count)
 
 	// And go!
 	alSourcePlay(source);
-	wxTimer::Start(100);
-	playback_segment_timer.Start();
+	last_mix_position = 0;
+	last_mix_time = std::chrono::steady_clock::now();
+	wxTimer::Start(20);
 }
 
 void OpenALPlayer::Stop()
 {
 	wxTimer::Stop();
+	if (playing) last_position = GetCurrentPosition();
 	playing = false;
-	start_frame = 0;
-	cur_frame = 0;
-	end_frame = 0;
-
-	// Stop and detach the source while its context is still valid.
 	if (context) {
 		alcMakeContextCurrent(context);
 		alSourceStop(source);
@@ -234,7 +291,8 @@ void OpenALPlayer::FillBuffers(ALsizei count)
 	InitContext();
 	// Do the actual filling/queueing
 	for (count = mid(0, count, buffers_free); count > 0; --count) {
-		ALsizei fill_len = mid<ALsizei>(0, decode_buffer.size() / bpf, end_frame - cur_frame);
+		ALsizei frames = decode_buffer.size() / bpf;
+		ALsizei fill_len = std::clamp<int64_t>(end_frame - cur_frame, 0, frames);
 
 		if (fill_len > 0)
 			// Get fill_len frames of audio
@@ -243,7 +301,7 @@ void OpenALPlayer::FillBuffers(ALsizei count)
 			// And zerofill the rest
 			memset(&decode_buffer[fill_len * bpf], 0, decode_buffer.size() - fill_len * bpf);
 
-		cur_frame += fill_len;
+		cur_frame += frames;
 
 		alBufferData(buffers[buf_first_free], provider->GetChannels() == 1 ? AL_FORMAT_MONO16 : AL_FORMAT_STEREO16,
 			&decode_buffer[0], decode_buffer.size(), samplerate);
@@ -257,6 +315,13 @@ void OpenALPlayer::Notify()
 {
 	if (!playing) return;
 	alcMakeContextCurrent(context);
+	UpdateLatency();
+	// Continue feeding silence until the last requested sample is audible, rather
+	// than destroying the context as soon as that sample has reached the mixer.
+	if (GetCurrentPosition() >= end_frame) {
+		Stop();
+		return;
+	}
 	ALsizei newplayed;
 	alGetSourcei(source, AL_BUFFERS_PROCESSED, &newplayed);
 
@@ -274,34 +339,83 @@ void OpenALPlayer::Notify()
 
 		// Update
 		buffers_played += newplayed;
-		playback_segment_timer.Start();
 
 		// Fill more buffers
 		FillBuffers(newplayed);
 	}
-
 	ALint state = AL_INITIAL;
 	alGetSourcei(source, AL_SOURCE_STATE, &state);
 	if (state == AL_STOPPED) alSourcePlay(source); // Recover after an underrun.
-
-	LOG_D("player/audio/openal") << "frames played=" << (buffers_played - num_buffers) * decode_buffer.size() / bpf << " num frames=" << end_frame - start_frame;
-	// Check that all of the selected audio plus one full set of buffers has been queued
-	if ((buffers_played - num_buffers) * (int64_t)decode_buffer.size() > (end_frame - start_frame) * bpf) {
-		Stop();
-	}
 }
 
 void OpenALPlayer::SetEndPosition(int64_t pos)
 {
+	// Queued buffers may already contain samples past a shortened selection, or
+	// silence past an extended one. Replace them from the audible playhead.
+	if (playing && pos != end_frame && cur_frame > std::min(pos, end_frame)) {
+		auto current = GetCurrentPosition();
+		Play(current, std::max<int64_t>(0, pos - current));
+		return;
+	}
 	end_frame = pos;
 }
 
 int64_t OpenALPlayer::GetCurrentPosition()
 {
-	// FIXME: this should be based on not duration played but actual sample being heard
-	// (during video playback, cur_frame might get changed to resync)
-	long extra = playback_segment_timer.Time();
-	return buffers_played * decode_buffer.size() / bpf + start_frame + extra * samplerate / 1000;
+	if (!playing) return last_position;
+	alcMakeContextCurrent(context);
+	ALint state = AL_INITIAL;
+	alGetSourcei(source, AL_SOURCE_STATE, &state);
+	double offset = 0;
+	double latency = output_latency;
+	if (get_source_latency) {
+		ALdouble values[2] = {};
+		get_source_latency(source, 0x1201 /* AL_SEC_OFFSET_LATENCY_SOFT */, values);
+		offset = values[0] * samplerate;
+		latency = values[1];
+	}
+	else {
+		ALint samples = 0;
+		alGetSourcei(source, AL_SAMPLE_OFFSET, &samples);
+		offset = samples;
+	}
+	if (state == AL_STOPPED) {
+		// OpenAL resets the offset to zero on underrun, but every queued buffer
+		// has been consumed. Preserve that position when restarting the source.
+		ALint processed = 0;
+		alGetSourcei(source, AL_BUFFERS_PROCESSED, &processed);
+		offset = processed * static_cast<double>(decode_buffer.size() / bpf);
+	}
+	int64_t mixed = buffers_played * static_cast<int64_t>(decode_buffer.size() / bpf)
+		+ static_cast<int64_t>(offset);
+	auto now = std::chrono::steady_clock::now();
+	if (state == AL_STOPPED) {
+		// The device continues draining after the mixer runs out of buffers.
+		// Estimate when that happened from the last observed mixer position.
+		double elapsed = std::chrono::duration<double>(now - last_mix_time).count();
+		double mixed_time = static_cast<double>(mixed - last_mix_position) / samplerate;
+		latency = std::max(0., latency - std::max(0., elapsed - mixed_time));
+	}
+	else {
+		last_mix_position = mixed;
+		last_mix_time = now;
+	}
+	int64_t position = start_frame + mixed - static_cast<int64_t>(latency * samplerate);
+	// Hold at the start while the output pipeline fills, and avoid backwards
+	// motion when the reported latency changes.
+	last_position = std::max(last_position, position);
+	return last_position;
+}
+
+void OpenALPlayer::UpdateLatency()
+{
+#ifdef __APPLE__
+	auto now = std::chrono::steady_clock::now();
+	if (!get_source_latency && now >= next_latency_update) {
+		output_latency = GetOutputLatency();
+		next_latency_update = now + std::chrono::milliseconds(100);
+	}
+#endif
 }
 }
 
